@@ -44,6 +44,22 @@ except ImportError:
 
 __version__ = "1.1.0"
 
+# ─── Tool-call emulation constants ────────────────────────────────────────
+# Gemini has no native function calling, so we ask it to signal a tool call
+# as plain text using these tags, then parse them back out. XML-style tags
+# (rather than the old ```tool_call fenced block) are used because Gemini
+# often wraps real code in markdown fences too, which made the old fenced
+# format ambiguous to parse reliably.
+TOOL_CALL_OPEN = "<tool_call>"
+TOOL_CALL_CLOSE = "</tool_call>"
+TOOL_CALL_RE = re.compile(
+    re.escape(TOOL_CALL_OPEN) + r"\s*(\{.*?\})\s*" + re.escape(TOOL_CALL_CLOSE),
+    re.DOTALL | re.IGNORECASE,
+)
+# Strip stray markdown fences Gemini sometimes wraps the tags in anyway,
+# despite being told not to.
+CODE_FENCE_RE = re.compile(r"```(?:json|xml|tool_call)?\s*|\s*```")
+
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 DEFAULT_CONFIG = {
@@ -359,26 +375,83 @@ def extract_response_text(raw: str) -> str:
 
 # ─── OpenAI Format Helpers ───────────────────────────────────────────────────
 
+def _compact_tool_line(tool_def: dict) -> str:
+    """One short line per tool: name, first sentence of its description, and
+    just the required parameter names - not the full multi-paragraph
+    description and complete JSON schema some clients (e.g. Claude Code)
+    send. Forwarding the full text for every tool buries the tool-call
+    format instructions under thousands of tokens of noise, which is why
+    Gemini would ignore the format entirely on large tool lists."""
+    name = tool_def.get("name", "")
+    description = (tool_def.get("description") or "").strip()
+    first_sentence = description.split(". ")[0].split("\n")[0].strip()
+    if len(first_sentence) > 140:
+        first_sentence = first_sentence[:140].rstrip() + "..."
+
+    schema = tool_def.get("parameters", {}) or {}
+    props = schema.get("properties", {}) or {}
+    required = schema.get("required", [])
+    param_bits = [f"{p}:{props.get(p, {}).get('type', 'any')}" for p in required]
+    optional = [p for p in props if p not in required]
+    params_str = ", ".join(param_bits) if param_bits else "none"
+    if optional:
+        params_str += f" (optional: {', '.join(optional[:6])})"
+
+    return f"- {name}({params_str}) — {first_sentence}"
+
+
+def _normalize_tool_def(tool: dict) -> dict:
+    """Tools arrive in two shapes depending on the caller: OpenAI-style
+    {"type": "function", "function": {name, description, parameters}}, or
+    already-flat {name, description, parameters} (from
+    anthropic_tools_to_internal). Normalize to the flat form."""
+    if tool.get("type") == "function" and "function" in tool:
+        fn = tool["function"]
+    else:
+        fn = tool
+    return {
+        "name": fn.get("name", tool.get("name", "")),
+        "description": fn.get("description", tool.get("description", "")),
+        "parameters": fn.get("parameters", tool.get("parameters", {})),
+    }
+
+
+def build_tool_block(tools: list) -> str:
+    """Build the tool-call format instructions. Callers append this at the
+    very END of the prompt (right before Gemini generates), not the start -
+    models attend far more to the tail of a long prompt, and putting this
+    up front let it get diluted by everything that follows it."""
+    if not tools:
+        return ""
+
+    tool_defs = [_normalize_tool_def(t) for t in tools]
+    tools_block = "\n".join(_compact_tool_line(t) for t in tool_defs)
+
+    return (
+        "---\n"
+        "[TOOL-CALL FORMAT - read this last block carefully, it overrides "
+        "any other formatting instructions above]\n"
+        "You can call exactly one of these tools per turn:\n"
+        f"{tools_block}\n\n"
+        "To call a tool, your ENTIRE reply must be nothing but:\n"
+        f"{TOOL_CALL_OPEN}\n"
+        '{"name": "<tool name>", "arguments": {<args>}}\n'
+        f"{TOOL_CALL_CLOSE}\n"
+        "No explanation, no markdown fences, no text outside the tags, no "
+        "other tags or schema of your own invention. If no tool is needed, "
+        "reply with plain text instead and skip the tags entirely.\n"
+        "Example — User: list files in this directory\n"
+        f"{TOOL_CALL_OPEN}\n"
+        '{"name": "list_files", "arguments": {"path": "."}}\n'
+        f"{TOOL_CALL_CLOSE}"
+    )
+
+
 def messages_to_prompt(messages: list, tools: list = None) -> str:
-    """Convert OpenAI messages to prompt string."""
+    """Convert OpenAI-style messages to a prompt string. The tool-call
+    format block (if any tools were supplied) is appended at the very end,
+    after the full message history, instead of injected at the top."""
     parts = []
-    if tools:
-        tool_defs = []
-        for tool in tools:
-            fn = tool.get("function", tool) if tool.get("type") == "function" else tool
-            tool_defs.append({
-                "name": fn.get("name", tool.get("name", "")),
-                "description": fn.get("description", tool.get("description", "")),
-                "parameters": fn.get("parameters", tool.get("parameters", {})),
-            })
-        if tool_defs:
-            parts.append(
-                "[System instruction]: You have access to tools. "
-                "To call a tool, respond with:\n"
-                '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
-                "Only use tool_call blocks when needed.\n\n"
-                f"Available tools:\n{json.dumps(tool_defs, indent=2)}"
-            )
     for msg in messages:
         role = msg.get("role", "user")
         content = msg.get("content", "")
@@ -395,8 +468,10 @@ def messages_to_prompt(messages: list, tools: list = None) -> str:
                 for tc in msg["tool_calls"]:
                     fn = tc.get("function", {})
                     tc_strs.append(
-                        f'```tool_call\n{{"name": "{fn.get("name")}", '
-                        f'"arguments": {fn.get("arguments", "{}")}}}\n```'
+                        f"{TOOL_CALL_OPEN}\n"
+                        f'{{"name": "{fn.get("name")}", '
+                        f'"arguments": {fn.get("arguments", "{}")}}}\n'
+                        f"{TOOL_CALL_CLOSE}"
                     )
                 parts.append(f"[Assistant]: {content or ''}\n" + "\n".join(tc_strs))
             else:
@@ -405,16 +480,22 @@ def messages_to_prompt(messages: list, tools: list = None) -> str:
             parts.append(f"[Tool result for {msg.get('name', '')}]: {content}")
         else:
             parts.append(content if content else "")
+
+    tool_block = build_tool_block(tools)
+    if tool_block:
+        parts.append(tool_block)
+
     return "\n\n".join(p for p in parts if p)
 
 
 def parse_tool_calls(text: str) -> tuple:
-    """Extract tool_call blocks. Returns (clean_text, tool_calls_list)."""
+    """Extract <tool_call>{...}</tool_call> blocks. Returns (clean_text, tool_calls_list)."""
+    cleaned = CODE_FENCE_RE.sub("", text)
+    matches = TOOL_CALL_RE.findall(cleaned)
     tool_calls = []
-    pattern = r'```tool_call\s*\n(.*?)\n```'
-    for match in re.findall(pattern, text, re.DOTALL):
+    for raw_json in matches:
         try:
-            data = json.loads(match.strip())
+            data = json.loads(raw_json.strip())
             tool_calls.append({
                 "id": f"call_{uuid.uuid4().hex[:8]}",
                 "type": "function",
@@ -424,8 +505,12 @@ def parse_tool_calls(text: str) -> tuple:
                 },
             })
         except (json.JSONDecodeError, KeyError):
-            pass
-    clean = re.sub(pattern, '', text, flags=re.DOTALL).strip()
+            log(f"tool_call tags found but JSON was invalid: {raw_json!r}")
+
+    if not tool_calls:
+        log(f"no tool_call tags found in response: {text[:300]!r}")
+
+    clean = TOOL_CALL_RE.sub("", cleaned).strip()
     return clean, tool_calls
 
 
@@ -719,20 +804,32 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "*")
         self.end_headers()
 
+    def do_HEAD(self):
+        # Some clients/health-checks probe with HEAD; BaseHTTPRequestHandler
+        # has no default handler for it (-> 501). Answer minimally so those
+        # probes don't spam the log with unsupported-method errors.
+        path_only = self.path.split("?", 1)[0]
+        status = 200 if path_only in ("/", "/v1/models") else 404
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
     def do_GET(self):
         try:
             if self.path.startswith("/v1") and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
-            if self.path == "/v1/models":
+            path_only = self.path.split("?", 1)[0]
+            if path_only == "/v1/models":
                 self.send_json({"object": "list", "data": [
                     {"id": n, "object": "model", "created": 1700000000,
                      "owned_by": "google", "description": c["desc"]}
                     for n, c in MODELS.items()
                 ]})
-            elif self.path.startswith("/v1beta/models"):
+            elif path_only.startswith("/v1beta/models"):
                 self._handle_google_models_list()
-            elif self.path == "/":
+            elif path_only == "/":
                 self.send_json({"status": "ok", "version": __version__,
                                 "api_format": CONFIG.get("api_format", "anthropic"),
                                 "models": list(MODELS.keys())})
@@ -751,25 +848,26 @@ class GeminiHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length) if length else b""
             api_format = CONFIG.get("api_format", "anthropic")
+            path_only = self.path.split("?", 1)[0]
 
-            if self.path == "/v1/messages":
+            if path_only == "/v1/messages":
                 if api_format != "anthropic":
                     self.send_json({"error": {"message": "server is running in --openai mode; /v1/messages is disabled"}}, 404)
                     return
                 self.handle_anthropic_messages(body)
-            elif self.path == "/v1/chat/completions":
+            elif path_only == "/v1/chat/completions":
                 if api_format != "openai":
                     self.send_json({"error": {"message": "server is running in --anthropic mode; use /v1/messages instead"}}, 404)
                     return
                 self.handle_chat(body)
-            elif self.path == "/v1/responses":
+            elif path_only == "/v1/responses":
                 if api_format != "openai":
                     self.send_json({"error": {"message": "server is running in --anthropic mode; use /v1/messages instead"}}, 404)
                     return
                 self.handle_responses(body)
-            elif ":generateContent" in self.path:
+            elif ":generateContent" in path_only:
                 self._handle_google_generate(body, stream=False)
-            elif ":streamGenerateContent" in self.path:
+            elif ":streamGenerateContent" in path_only:
                 self._handle_google_generate(body, stream=True)
             else:
                 self.send_json({"error": "not found"}, 404)
@@ -793,8 +891,22 @@ class GeminiHandler(BaseHTTPRequestHandler):
         return model_name, cfg["mode"], (think_override if think_override is not None else cfg["think"]), None
 
     def _call_gemini(self, prompt, model_id, think_mode, tools):
-        raw = gemini_stream_generate(prompt, model_id, think_mode)
-        text = extract_response_text(raw)
+        text = ""
+        raw = None
+        attempts = max(1, CONFIG.get("retry_attempts", 1))
+        for attempt in range(attempts):
+            raw = gemini_stream_generate(prompt, model_id, think_mode)
+            text = extract_response_text(raw)
+            if text:
+                break
+            # A successful HTTP round-trip but an empty extraction usually
+            # means the batchexecute response was in an odd/partial shape
+            # this attempt (parsing is regex/index based, not a real
+            # protocol client) - retry rather than surfacing a blank
+            # response, which Claude Code shows as a generic error.
+            if attempt < attempts - 1:
+                log(f"empty extraction on attempt {attempt+1}/{attempts}, retrying")
+                time.sleep(CONFIG.get("retry_delay_sec", 1))
         tool_calls = None
         if tools and text:
             text, tool_calls = parse_tool_calls(text)
